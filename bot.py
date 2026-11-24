@@ -38,7 +38,7 @@ application = None
 START_TEXT = (
     "👋 Netflix Cookie Checker Bot\n\n"
     "Paste your Netflix cookies here.\n\n"
-    Accepted formats:\n"
+    "Accepted formats:\n"
     "• Full `Cookie:` header line\n"
     "• Netscape format - tab or space delimited\n"
     "• JSON array format\n"
