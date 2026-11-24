@@ -1,5 +1,5 @@
+# Archivos locales que no deben subirse a GitHub
+cookies.json
 __pycache__/
-*.py[cod]
-*.so
+*.pyc
 .env
-.DS_Store
